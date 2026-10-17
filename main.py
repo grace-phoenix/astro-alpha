@@ -90,7 +90,8 @@ class WelcomeBot(discord.Client):
 
     async def setup_hook(self):
         await start_web_server()
-        await self.tree.sync()  # global sync; can take a few minutes to show up
+        if os.environ.get("SYNC_COMMANDS") == "1":
+            await self.tree.sync()
 
 
 bot = WelcomeBot()
