@@ -2,15 +2,62 @@ import json
 import logging
 import os
 from pathlib import Path
+import asyncio
+import time
 
 import discord
 from discord import app_commands
 
 from aiohttp import web
 
+LOGIN_COOLDOWN = 60  # seconds between login attempts
+_attempt_task: asyncio.Task | None = None
+_last_attempt = 0.0
+
+
+async def attempt_login():
+    """Log in, then keep the gateway connection running until it drops."""
+    global _last_attempt
+    _last_attempt = time.monotonic()
+    try:
+        await bot.login(TOKEN)
+    except discord.HTTPException as e:
+        if e.status == 429:
+            logging.warning("Discord rate limited the login. Will retry on a later ping.")
+        else:
+            logging.error("Login failed with HTTP %s: %s", e.status, e.text)
+        return
+    except Exception:
+        logging.exception("Unexpected error during login. Will retry on a later ping.")
+        return
+
+    logging.info("Login succeeded, connecting to the gateway")
+    try:
+        await bot.connect(reconnect=True)  # runs until the connection ends
+    except Exception:
+        logging.exception("Gateway connection ended. Will reconnect on a later ping.")
+
+
+def ensure_login_attempt():
+    """Start a login attempt if the bot is offline, none is running, and the cooldown has passed."""
+    global _attempt_task
+    if bot.is_ready():
+        return
+    if _attempt_task is not None and not _attempt_task.done():
+        return
+    if time.monotonic() - _last_attempt < LOGIN_COOLDOWN:
+        return
+    _attempt_task = asyncio.create_task(attempt_login())
+
+
+async def keepalive(request: web.Request) -> web.Response:
+    ensure_login_attempt()
+    return web.Response(text="online" if bot.is_ready() else "starting")
+
+
 async def start_web_server():
     app = web.Application()
-    app.router.add_get("/", lambda request: web.Response(text="ok"))
+    app.router.add_get("/", keepalive)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000)))
@@ -89,7 +136,6 @@ class WelcomeBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        await start_web_server()
         if os.environ.get("SYNC_COMMANDS") == "1":
             await self.tree.sync()
 
@@ -223,4 +269,11 @@ async def welcome_show(interaction: discord.Interaction):
 
 bot.tree.add_command(welcome)
 
-bot.run(TOKEN)
+async def main():
+    await start_web_server()
+    ensure_login_attempt()  # first try at startup; later tries come from pings
+    await asyncio.Event().wait()  # keep the process alive forever
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
